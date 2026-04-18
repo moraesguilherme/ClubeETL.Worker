@@ -33,9 +33,24 @@ public interface IEtlRepository
         string? message,
         CancellationToken cancellationToken);
 
+    Task<ImportRowStateResolution> ResolveImportRowStateAsync(
+        string externalRowKey,
+        string sourceContentHash,
+        CancellationToken cancellationToken);
+
     Task<long> CreateImportRowAsync(
         Guid batchId,
         ImportRowModel row,
+        CancellationToken cancellationToken);
+
+    Task SupersedeImportRowAsync(
+        long importRowId,
+        long replacedByImportRowId,
+        CancellationToken cancellationToken);
+
+    Task SetImportRowStatusAsync(
+        long importRowId,
+        string status,
         CancellationToken cancellationToken);
 
     Task AddRowErrorAsync(

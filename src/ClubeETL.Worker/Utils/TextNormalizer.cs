@@ -8,7 +8,9 @@ public static class TextNormalizer
     public static string NormalizeKey(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
+        {
             return string.Empty;
+        }
 
         var formD = value.Trim().ToUpperInvariant().Normalize(NormalizationForm.FormD);
         var sb = new StringBuilder();
@@ -17,7 +19,9 @@ public static class TextNormalizer
         {
             var category = CharUnicodeInfo.GetUnicodeCategory(ch);
             if (category == UnicodeCategory.NonSpacingMark)
+            {
                 continue;
+            }
 
             if (char.IsLetterOrDigit(ch))
             {
@@ -26,11 +30,21 @@ public static class TextNormalizer
             }
 
             if (char.IsWhiteSpace(ch) || ch == '_' || ch == '-' || ch == '/' || ch == '.')
+            {
                 sb.Append(' ');
+            }
         }
 
-        return string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+        return string.Join(
+            ' ',
+            sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
+
+    public static bool EqualsNormalized(string? left, string right) =>
+        string.Equals(
+            NormalizeKey(left),
+            NormalizeKey(right),
+            StringComparison.Ordinal);
 
     public static bool ContainsNormalized(string? source, string expected)
     {

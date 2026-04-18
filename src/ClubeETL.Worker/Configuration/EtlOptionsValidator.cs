@@ -15,6 +15,9 @@ public sealed class EtlOptionsValidator : IValidateOptions<EtlOptions>
         if (string.IsNullOrWhiteSpace(options.ErrorFolder))
             return ValidateOptionsResult.Fail("Etl:ErrorFolder e obrigatorio.");
 
+        if (string.IsNullOrWhiteSpace(options.SourceSystem))
+            return ValidateOptionsResult.Fail("Etl:SourceSystem e obrigatorio.");
+
         var mode = (options.Mode ?? string.Empty).Trim();
         if (!mode.Equals("Manual", StringComparison.OrdinalIgnoreCase) &&
             !mode.Equals("Watch", StringComparison.OrdinalIgnoreCase))

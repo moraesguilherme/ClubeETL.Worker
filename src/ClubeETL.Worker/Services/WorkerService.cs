@@ -1,6 +1,4 @@
 using ClubeETL.Worker.Configuration;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace ClubeETL.Worker.Services;
@@ -26,23 +24,76 @@ public sealed class WorkerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var watchMode = _options.Mode.Equals("Watch", StringComparison.OrdinalIgnoreCase);
+        var watchMode = string.Equals(_options.Mode, "Watch", StringComparison.OrdinalIgnoreCase);
 
         if (!watchMode)
         {
             _logger.LogInformation("Executando em modo Manual.");
-            await _spreadsheetImportService.ImportPendingFilesAsync(stoppingToken);
+
+            var pendingFiles = GetPendingFiles();
+
+            if (pendingFiles.Count == 0)
+            {
+                _logger.LogInformation("Nenhum arquivo pendente encontrado em {InputFolder}", _options.InputFolder);
+                _lifetime.StopApplication();
+                return;
+            }
+
+            foreach (var filePath in pendingFiles)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                try
+                {
+                    await _spreadsheetImportService.ProcessFileAsync(filePath, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Erro ao processar arquivo {FilePath} no modo Manual.", filePath);
+                }
+            }
+
             _lifetime.StopApplication();
             return;
         }
 
-        _logger.LogInformation("Executando em modo Watch. Intervalo: {Seconds}s", _options.PollingIntervalSeconds);
+        _logger.LogInformation(
+            "Executando em modo Watch. Intervalo: {Seconds}s. Pasta monitorada: {InputFolder}",
+            _options.PollingIntervalSeconds,
+            _options.InputFolder);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await _spreadsheetImportService.ImportPendingFilesAsync(stoppingToken);
+                var pendingFiles = GetPendingFiles();
+
+                if (pendingFiles.Count == 0)
+                {
+                    _logger.LogDebug("Nenhum arquivo pendente encontrado.");
+                }
+                else
+                {
+                    foreach (var filePath in pendingFiles)
+                    {
+                        if (stoppingToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        try
+                        {
+                            await _spreadsheetImportService.ProcessFileAsync(filePath, stoppingToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Erro ao processar arquivo {FilePath} no modo Watch.", filePath);
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -51,5 +102,37 @@ public sealed class WorkerService : BackgroundService
 
             await Task.Delay(TimeSpan.FromSeconds(_options.PollingIntervalSeconds), stoppingToken);
         }
+    }
+
+    private List<string> GetPendingFiles()
+    {
+        if (string.IsNullOrWhiteSpace(_options.InputFolder))
+        {
+            _logger.LogWarning("InputFolder nao configurada.");
+            return [];
+        }
+
+        if (!Directory.Exists(_options.InputFolder))
+        {
+            _logger.LogWarning("Pasta de entrada nao encontrada: {InputFolder}", _options.InputFolder);
+            return [];
+        }
+
+        var allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".xlsx",
+            ".xls"
+        };
+
+        if (_options.IncludeCsv)
+        {
+            allowedExtensions.Add(".csv");
+        }
+
+        return Directory
+            .EnumerateFiles(_options.InputFolder, "*.*", SearchOption.TopDirectoryOnly)
+            .Where(path => allowedExtensions.Contains(Path.GetExtension(path)))
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 }

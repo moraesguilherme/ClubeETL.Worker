@@ -1,22 +1,29 @@
 using ClubeETL.Worker.Configuration;
-using ClubeETL.Worker.Parsing;
+using ClubeETL.Worker.Models;
 using ClubeETL.Worker.Persistence;
+using ClubeETL.Worker.Parsing;
 using ClubeETL.Worker.Services;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
+using Dapper;
 
-var builder = Host.CreateApplicationBuilder(args);
+internal class Program
+{
+    private static async Task Main(string[] args)
+    {
+        var builder = Host.CreateApplicationBuilder(args);
 
-builder.Services.Configure<EtlOptions>(builder.Configuration.GetSection(EtlOptions.SectionName));
-builder.Services.AddSingleton<IValidateOptions<EtlOptions>, EtlOptionsValidator>();
+        DefaultTypeMap.MatchNamesWithUnderscores = true;
 
-builder.Services.AddSingleton<HotelWorkbookParser>();
-builder.Services.AddSingleton<CrecheWorkbookParser>();
-builder.Services.AddSingleton<ISpreadsheetImportService, SpreadsheetImportService>();
-builder.Services.AddSingleton<IEtlRepository, EtlRepository>();
+        builder.Services.Configure<EtlOptions>(
+            builder.Configuration.GetSection(EtlOptions.SectionName));
 
-builder.Services.AddHostedService<WorkerService>();
+        builder.Services.AddSingleton<UnifiedPaymentsWorkbookParser>();
+        builder.Services.AddSingleton<IEtlRepository, EtlRepository>();
+        builder.Services.AddSingleton<ISpreadsheetImportService, SpreadsheetImportService>();
 
-var host = builder.Build();
-await host.RunAsync();
+        builder.Services.AddHostedService<WorkerService>();
+        builder.Services.AddSingleton<SpreadsheetImportService>();
+
+        var host = builder.Build();
+        await host.RunAsync();
+    }
+}

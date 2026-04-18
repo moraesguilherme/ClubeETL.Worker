@@ -1,290 +1,390 @@
-using ClosedXML.Excel;
 using ClubeETL.Worker.Configuration;
 using ClubeETL.Worker.Models;
 using ClubeETL.Worker.Parsing;
 using ClubeETL.Worker.Persistence;
 using ClubeETL.Worker.Utils;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace ClubeETL.Worker.Services;
 
 public sealed class SpreadsheetImportService : ISpreadsheetImportService
 {
-    private readonly EtlOptions _options;
+    private readonly UnifiedPaymentsWorkbookParser _parser;
     private readonly IEtlRepository _repository;
-    private readonly HotelWorkbookParser _hotelParser;
-    private readonly CrecheWorkbookParser _crecheParser;
     private readonly ILogger<SpreadsheetImportService> _logger;
+    private readonly EtlOptions _options;
 
     public SpreadsheetImportService(
-        IOptions<EtlOptions> options,
+        UnifiedPaymentsWorkbookParser parser,
         IEtlRepository repository,
-        HotelWorkbookParser hotelParser,
-        CrecheWorkbookParser crecheParser,
+        IOptions<EtlOptions> options,
         ILogger<SpreadsheetImportService> logger)
     {
-        _options = options.Value;
+        _parser = parser;
         _repository = repository;
-        _hotelParser = hotelParser;
-        _crecheParser = crecheParser;
         _logger = logger;
+        _options = options.Value;
     }
 
-    public async Task ImportPendingFilesAsync(CancellationToken cancellationToken)
-    {
-        EnsureFolders();
-
-        var files = Directory
-            .EnumerateFiles(_options.InputFolder, "*.*", SearchOption.TopDirectoryOnly)
-            .Where(IsSupportedFile)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        if (files.Count == 0)
-        {
-            _logger.LogInformation("Nenhum arquivo pendente encontrado em {Folder}", _options.InputFolder);
-            return;
-        }
-
-        foreach (var file in files)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await ProcessFileAsync(file, cancellationToken);
-        }
-    }
-
-    private async Task ProcessFileAsync(string filePath, CancellationToken cancellationToken)
+    public async Task ProcessFileAsync(string filePath, CancellationToken cancellationToken)
     {
         var fileName = Path.GetFileName(filePath);
-        _logger.LogInformation("Processando arquivo {FileName}", fileName);
 
         Guid batchId = Guid.Empty;
-        Guid runId = Guid.Empty;
-        var importedRows = 0;
-        var erroredRows = 0;
+        Guid processingRunId = Guid.Empty;
+
         var processedRows = 0;
-        var finalStatus = "processed";
-        string? finalNote = null;
+        var successRows = 0;
+        var ignoredRows = 0;
+        var errorRows = 0;
 
         try
         {
-            using var workbook = new XLWorkbook(filePath);
+            _logger.LogInformation("Iniciando processamento do arquivo {FileName}", fileName);
 
-            var parserType = ResolveParserType(workbook);
-            var reference = ResolveReference(workbook, filePath, parserType);
+            var parsedRows = _parser.Parse(filePath);
+
+            var referenceYear = parsedRows
+                .Select(x => x.ReferenceYear)
+                .FirstOrDefault(x => x.HasValue);
+
+            var referenceMonth = parsedRows
+                .Select(x => x.ReferenceMonth)
+                .FirstOrDefault(x => x.HasValue);
 
             batchId = await _repository.CreateBatchAsync(
                 fileName,
                 filePath,
-                parserType,
+                "unified_payments_sheet",
                 _options.SourceSystem,
-                reference.ReferenceYear,
-                reference.ReferenceMonth,
+                referenceYear,
+                referenceMonth,
                 cancellationToken);
 
-            runId = await _repository.CreateProcessingRunAsync(batchId, fileName, cancellationToken);
+            await _repository.SetBatchStatusAsync(
+                batchId,
+                "processing",
+                "Arquivo em processamento.",
+                cancellationToken);
 
-            IReadOnlyList<ImportRowModel> rows = parserType switch
+            processingRunId = await _repository.CreateProcessingRunAsync(
+                batchId,
+                fileName,
+                cancellationToken);
+
+            foreach (var rawRow in parsedRows)
             {
-                "hotel_agenda" => _hotelParser.Parse(filePath, workbook),
-                "creche_mensal" => _crecheParser.Parse(filePath, workbook),
-                _ => throw new InvalidOperationException($"Nenhum parser suportado para o arquivo {fileName}.")
-            };
+                cancellationToken.ThrowIfCancellationRequested();
+                processedRows++;
 
-            processedRows = rows.Count;
-
-            foreach (var row in rows)
-            {
                 try
                 {
-                    await _repository.CreateImportRowAsync(batchId, row, cancellationToken);
-                    importedRows++;
+                    var state = await _repository.ResolveImportRowStateAsync(
+                        rawRow.ExternalRowKey,
+                        rawRow.SourceContentHash,
+                        cancellationToken);
+
+                    if (state.IsUnchanged)
+                    {
+                        ignoredRows++;
+
+                        _logger.LogDebug(
+                            "Linha ignorada por hash inalterado. ExternalRowKey={ExternalRowKey}",
+                            rawRow.ExternalRowKey);
+
+                        continue;
+                    }
+
+                    var pets = PetSplitter.Split(rawRow.RawPetNames);
+
+                    if (pets.Count == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"A linha {rawRow.SourceRowNumber} nao possui pets validos para importacao.");
+                    }
+
+                    var insertedImportRowIds = new List<long>();
+
+                    for (var i = 0; i < pets.Count; i++)
+                    {
+                        var importRow = MapToImportRow(rawRow, pets[i], i + 1);
+
+                        var importRowId = await _repository.CreateImportRowAsync(
+                            batchId,
+                            importRow,
+                            cancellationToken);
+
+                        insertedImportRowIds.Add(importRowId);
+
+                        await _repository.SetImportRowStatusAsync(
+                            importRowId,
+                            "processed",
+                            cancellationToken);
+                    }
+
+                    if (state.IsChanged &&
+                        state.ExistingImportRowId.HasValue &&
+                        insertedImportRowIds.Count > 0)
+                    {
+                        await _repository.SupersedeImportRowAsync(
+                            state.ExistingImportRowId.Value,
+                            insertedImportRowIds[0],
+                            cancellationToken);
+                    }
+
+                    successRows += insertedImportRowIds.Count;
                 }
-                catch (Exception ex)
+                catch (Exception rowEx)
                 {
-                    erroredRows++;
-                    _logger.LogError(ex, "Falha ao inserir linha {RowNumber} do arquivo {FileName}", row.SourceRowNumber, fileName);
+                    errorRows++;
+
+                    _logger.LogError(
+                        rowEx,
+                        "Erro ao processar linha {RowNumber} do arquivo {FileName}",
+                        rawRow.SourceRowNumber,
+                        fileName);
                 }
             }
 
-            finalStatus = erroredRows > 0 ? "processed_with_errors" : "processed";
-            finalNote = $"Arquivo processado. Linhas lidas: {processedRows}. Importadas: {importedRows}. Erros: {erroredRows}.";
+            var finalBatchStatus = errorRows > 0
+                ? "processed_with_errors"
+                : "processed";
 
-            await _repository.SetBatchStatusAsync(batchId, finalStatus, finalNote, cancellationToken);
-            await _repository.FinishProcessingRunAsync(runId, finalStatus, processedRows, importedRows, erroredRows, finalNote, cancellationToken);
+            var runSummary =
+                $"processed_rows={processedRows}; success_rows={successRows}; ignored_rows={ignoredRows}; error_rows={errorRows}";
 
-            MoveFileToProcessed(filePath);
-            _logger.LogInformation("Arquivo {FileName} finalizado com status {Status}", fileName, finalStatus);
+            await _repository.FinishProcessingRunAsync(
+                processingRunId,
+                finalBatchStatus,
+                processedRows,
+                successRows,
+                errorRows,
+                runSummary,
+                cancellationToken);
+
+            await _repository.SetBatchStatusAsync(
+                batchId,
+                finalBatchStatus,
+                runSummary,
+                cancellationToken);
+
+            MoveToProcessedFolder(filePath);
+
+            _logger.LogInformation(
+                "Processamento concluido. Arquivo={FileName}; Processadas={ProcessedRows}; Sucesso={SuccessRows}; Ignoradas={IgnoredRows}; Erros={ErrorRows}",
+                fileName,
+                processedRows,
+                successRows,
+                ignoredRows,
+                errorRows);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException)
         {
-            finalStatus = "failed";
-            finalNote = ex.Message;
+            _logger.LogWarning(
+                "Processamento cancelado para o arquivo {FileName}",
+                fileName);
 
-            _logger.LogError(ex, "Falha operacional ao processar o arquivo {FileName}", fileName);
+            if (processingRunId != Guid.Empty)
+            {
+                await SafeFinishRunAsync(
+                    processingRunId,
+                    "cancelled",
+                    processedRows,
+                    successRows,
+                    errorRows,
+                    "Processamento cancelado.");
+            }
 
             if (batchId != Guid.Empty)
             {
-                await SafeSetBatchStatusAsync(batchId, finalStatus, finalNote, cancellationToken);
+                await SafeSetBatchStatusAsync(
+                    batchId,
+                    "cancelled",
+                    "Processamento cancelado.");
             }
 
-            if (runId != Guid.Empty)
-            {
-                await SafeFinishRunAsync(runId, finalStatus, processedRows, importedRows, erroredRows + 1, finalNote, cancellationToken);
-            }
-
-            MoveFileToError(filePath);
-        }
-    }
-
-    private (int? ReferenceYear, int? ReferenceMonth) ResolveReference(XLWorkbook workbook, string filePath, string parserType)
-    {
-        int? year = null;
-        int? month = null;
-
-        if (parserType == "hotel_agenda")
-        {
-            year = 2026;
-        }
-        else if (parserType == "creche_mensal")
-        {
-            year = TryResolveYear(filePath, workbook) ?? DateTime.UtcNow.Year;
-
-            var monthlySheet = workbook.Worksheets.FirstOrDefault(x => MonthNameResolver.IsMonthlySheet(x.Name));
-            if (monthlySheet is not null && MonthNameResolver.TryGetMonth(monthlySheet.Name, out var detectedMonth))
-            {
-                month = detectedMonth;
-            }
-        }
-
-        return (year, month);
-    }
-
-    private string ResolveParserType(XLWorkbook workbook)
-    {
-        if (_hotelParser.CanHandle(workbook))
-            return "hotel_agenda";
-
-        if (_crecheParser.CanHandle(workbook))
-            return "creche_mensal";
-
-        throw new InvalidOperationException("Arquivo nao reconhecido como planilha de hotel ou creche.");
-    }
-
-    private bool IsSupportedFile(string path)
-    {
-        var ext = Path.GetExtension(path);
-
-        if (ext.Equals(".xlsx", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        if (_options.IncludeCsv && ext.Equals(".csv", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return false;
-    }
-
-    private void EnsureFolders()
-    {
-        Directory.CreateDirectory(_options.InputFolder);
-        Directory.CreateDirectory(_options.ProcessedFolder);
-        Directory.CreateDirectory(_options.ErrorFolder);
-    }
-
-    private void MoveFileToProcessed(string path)
-    {
-        var target = BuildUniqueTargetPath(_options.ProcessedFolder, Path.GetFileName(path));
-        File.Move(path, target, false);
-    }
-
-    private void MoveFileToError(string path)
-    {
-        var target = BuildUniqueTargetPath(_options.ErrorFolder, Path.GetFileName(path));
-        File.Move(path, target, false);
-    }
-
-    private static string BuildUniqueTargetPath(string folder, string fileName)
-    {
-        var target = Path.Combine(folder, fileName);
-        if (!File.Exists(target))
-            return target;
-
-        var name = Path.GetFileNameWithoutExtension(fileName);
-        var ext = Path.GetExtension(fileName);
-        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        return Path.Combine(folder, $"{name}_{stamp}{ext}");
-    }
-
-    private static int? TryResolveYear(string filePath, XLWorkbook workbook)
-    {
-        var fromFile = SpreadsheetValueParser.ParseYear(Path.GetFileNameWithoutExtension(filePath));
-        if (fromFile.HasValue)
-            return fromFile.Value;
-
-        foreach (var ws in workbook.Worksheets)
-        {
-            var fromSheet = SpreadsheetValueParser.ParseYear(ws.Name);
-            if (fromSheet.HasValue)
-                return fromSheet.Value;
-        }
-
-        return null;
-    }
-
-    private async Task SafeAddRowErrorAsync(
-    long importRowId,
-    string errorCode,
-    string errorMessage,
-    string errorStage,
-    CancellationToken cancellationToken)
-    {
-        try
-        {
-            await _repository.AddRowErrorAsync(
-                importRowId,
-                errorCode,
-                errorMessage,
-                errorStage,
-                cancellationToken);
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Nao foi possivel registrar erro da row em dbo.usp_etl_import_row_error_add.");
+            _logger.LogError(
+                ex,
+                "Falha operacional ao processar o arquivo {FileName}",
+                fileName);
+
+            if (processingRunId != Guid.Empty)
+            {
+                await SafeFinishRunAsync(
+                    processingRunId,
+                    "failed",
+                    processedRows,
+                    successRows,
+                    errorRows,
+                    ex.Message);
+            }
+
+            if (batchId != Guid.Empty)
+            {
+                await SafeSetBatchStatusAsync(
+                    batchId,
+                    "failed",
+                    ex.Message);
+            }
+
+            MoveToErrorFolder(filePath);
+
+            throw;
+        }
+    }
+
+    private static ImportRowModel MapToImportRow(
+        UnifiedPaymentRawRow rawRow,
+        string petName,
+        int petSplitIndex)
+    {
+        return new ImportRowModel
+        {
+            RowNumber = rawRow.SourceRowNumber,
+            ExternalRowKey = rawRow.ExternalRowKey,
+            SourceContentHash = rawRow.SourceContentHash,
+            RawPayloadJson = rawRow.RawPayloadJson,
+
+            SourceFileName = rawRow.SourceFileName,
+            SourceSheetName = rawRow.SourceSheetName,
+            SourceFileType = rawRow.SourceFileType,
+
+            OccurredAt = rawRow.OccurredAt,
+            CompetenceDate = rawRow.CompetenceDate,
+
+            CustomerNameRaw = rawRow.CustomerNameRaw,
+            CustomerDocumentRaw = rawRow.CustomerDocumentRaw,
+            CustomerPhoneRaw = rawRow.CustomerPhoneRaw,
+
+            RawPetNames = rawRow.RawPetNames,
+            PetNameRaw = petName,
+            PetSplitIndex = petSplitIndex,
+
+            ServiceTypeRaw = rawRow.ServiceTypeRaw,
+            PlanNameRaw = rawRow.PlanNameRaw,
+            PackageNameRaw = rawRow.PackageNameRaw,
+
+            PaymentMethodRaw = rawRow.PaymentMethodRaw,
+            PaymentStatusRaw = rawRow.PaymentStatusRaw,
+
+            GrossAmount = rawRow.GrossAmount,
+            TaxiAmount = rawRow.TaxiAmount,
+            GroupTotalAmount = rawRow.GroupTotalAmount,
+            NetAmount = rawRow.NetAmount,
+
+            StartDate = rawRow.StartDate,
+            EndDate = rawRow.EndDate,
+
+            ObservationRaw = rawRow.ObservationRaw,
+
+            ReferenceYear = rawRow.ReferenceYear,
+            ReferenceMonth = rawRow.ReferenceMonth
+        };
+    }
+
+    private void MoveToProcessedFolder(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(_options.ProcessedFolder))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(_options.ProcessedFolder);
+
+        var destinationPath = BuildDestinationPath(_options.ProcessedFolder, filePath);
+
+        if (File.Exists(destinationPath))
+        {
+            File.Delete(destinationPath);
+        }
+
+        File.Move(filePath, destinationPath);
+    }
+
+    private void MoveToErrorFolder(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(_options.ErrorFolder))
+        {
+            return;
+        }
+
+        if (!File.Exists(filePath))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(_options.ErrorFolder);
+
+        var destinationPath = BuildDestinationPath(_options.ErrorFolder, filePath);
+
+        if (File.Exists(destinationPath))
+        {
+            File.Delete(destinationPath);
+        }
+
+        File.Move(filePath, destinationPath);
+    }
+
+    private static string BuildDestinationPath(string folderPath, string originalFilePath)
+    {
+        var fileName = Path.GetFileName(originalFilePath);
+        return Path.Combine(folderPath, fileName);
+    }
+
+    private async Task SafeFinishRunAsync(
+        Guid processingRunId,
+        string status,
+        int processedRows,
+        int successRows,
+        int errorRows,
+        string? message)
+    {
+        try
+        {
+            await _repository.FinishProcessingRunAsync(
+                processingRunId,
+                status,
+                processedRows,
+                successRows,
+                errorRows,
+                message,
+                CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Falha ao finalizar processing run {ProcessingRunId} com status {Status}",
+                processingRunId,
+                status);
         }
     }
 
     private async Task SafeSetBatchStatusAsync(
         Guid batchId,
         string status,
-        string? note,
-        CancellationToken cancellationToken)
+        string? note)
     {
         try
         {
-            await _repository.SetBatchStatusAsync(batchId, status, note, cancellationToken);
+            await _repository.SetBatchStatusAsync(
+                batchId,
+                status,
+                note,
+                CancellationToken.None);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Nao foi possivel atualizar o status do batch.");
-        }
-    }
-
-    private async Task SafeFinishRunAsync(
-        Guid runId,
-        string status,
-        int processedRows,
-        int successRows,
-        int errorRows,
-        string? message,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await _repository.FinishProcessingRunAsync(runId, status, processedRows, successRows, errorRows, message, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Nao foi possivel finalizar o processing run.");
+            _logger.LogError(
+                ex,
+                "Falha ao atualizar batch {BatchId} com status {Status}",
+                batchId,
+                status);
         }
     }
 }

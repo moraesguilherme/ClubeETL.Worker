@@ -1,6 +1,6 @@
-namespace ClubeETL.Worker.Services;
+﻿namespace ClubeETL.Worker.Services;
 
 public interface ISpreadsheetImportService
 {
-    Task ImportPendingFilesAsync(CancellationToken cancellationToken);
+    Task ProcessFileAsync(string filePath, CancellationToken cancellationToken);
 }
