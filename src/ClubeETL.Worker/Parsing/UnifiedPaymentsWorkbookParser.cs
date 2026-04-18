@@ -16,8 +16,8 @@ public sealed class UnifiedPaymentsWorkbookParser
         "PET",
         "PLANO",
         "PACOTE",
-        "DATA ENTRADA HOTEL",
-        "DATA SAIDA HOTEL",
+        "DATA INICIO",
+        "DATA FIM",
         "COMPETENCIA",
         "TAXI",
         "VALOR POR CAO",
@@ -28,9 +28,9 @@ public sealed class UnifiedPaymentsWorkbookParser
         "DATA PAGAMENTO"
     };
 
-    public IReadOnlyList<UnifiedPaymentRawRow> Parse(string filePath)
+    public IReadOnlyList<UnifiedPaymentRawRow> Parse(string snapshotFilePath, string originalFileName)
     {
-        using var workbook = new XLWorkbook(filePath);
+        using var workbook = new XLWorkbook(snapshotFilePath);
 
         foreach (var worksheet in workbook.Worksheets)
         {
@@ -39,7 +39,7 @@ public sealed class UnifiedPaymentsWorkbookParser
                 continue;
             }
 
-            var fileName = Path.GetFileName(filePath);
+            var fileName = originalFileName;
 
             return ParseWorksheet(
                 worksheet,
@@ -84,8 +84,8 @@ public sealed class UnifiedPaymentsWorkbookParser
                 RawPetNames = ReadString(row, headerMap, "PET"),
                 PlanNameRaw = ReadString(row, headerMap, "PLANO"),
                 PackageNameRaw = ReadString(row, headerMap, "PACOTE"),
-                StartDate = ReadDate(row, headerMap, "DATA ENTRADA HOTEL"),
-                EndDate = ReadDate(row, headerMap, "DATA SAIDA HOTEL"),
+                StartDate = ReadDate(row, headerMap, "DATA INICIO"),
+                EndDate = ReadDate(row, headerMap, "DATA FIM"),
                 CompetenceDate = ReadCompetenceDate(row, headerMap, "COMPETENCIA"),
                 TaxiAmount = ReadDecimal(row, headerMap, "TAXI"),
                 GrossAmount = ReadDecimal(row, headerMap, "VALOR POR CAO"),

@@ -43,11 +43,6 @@ public interface IEtlRepository
         ImportRowModel row,
         CancellationToken cancellationToken);
 
-    Task SupersedeImportRowAsync(
-        long importRowId,
-        long replacedByImportRowId,
-        CancellationToken cancellationToken);
-
     Task SetImportRowStatusAsync(
         long importRowId,
         string status,
@@ -59,4 +54,14 @@ public interface IEtlRepository
         string errorMessage,
         string errorStage,
         CancellationToken cancellationToken);
+
+    Task SupersedeCurrentRowsByExternalRowKeyAsync(
+        string externalRowKey,
+        long? replacedByImportRowId,
+        CancellationToken cancellationToken);
+
+    Task SetReplacementForSupersededRowsAsync(
+    string externalRowKey,
+    long replacedByImportRowId,
+    CancellationToken cancellationToken);
 }

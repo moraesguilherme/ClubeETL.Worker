@@ -3,7 +3,6 @@ using ClubeETL.Worker.Models;
 using ClubeETL.Worker.Parsing;
 using ClubeETL.Worker.Persistence;
 using ClubeETL.Worker.Utils;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace ClubeETL.Worker.Services;
@@ -27,9 +26,9 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
         _options = options.Value;
     }
 
-    public async Task ProcessFileAsync(string filePath, CancellationToken cancellationToken)
+    public async Task ProcessFileAsync(string snapshotFilePath, string originalFilePath, CancellationToken cancellationToken)
     {
-        var fileName = Path.GetFileName(filePath);
+        var originalFileName = Path.GetFileName(originalFilePath);
 
         Guid batchId = Guid.Empty;
         Guid processingRunId = Guid.Empty;
@@ -41,9 +40,9 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
 
         try
         {
-            _logger.LogInformation("Iniciando processamento do arquivo {FileName}", fileName);
+            _logger.LogInformation("Iniciando processamento do arquivo {FileName}", originalFileName);
 
-            var parsedRows = _parser.Parse(filePath);
+            var parsedRows = _parser.Parse(snapshotFilePath, originalFileName);
 
             var referenceYear = parsedRows
                 .Select(x => x.ReferenceYear)
@@ -54,8 +53,8 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
                 .FirstOrDefault(x => x.HasValue);
 
             batchId = await _repository.CreateBatchAsync(
-                fileName,
-                filePath,
+                originalFileName,
+                originalFilePath,
                 "unified_payments_sheet",
                 _options.SourceSystem,
                 referenceYear,
@@ -70,7 +69,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
 
             processingRunId = await _repository.CreateProcessingRunAsync(
                 batchId,
-                fileName,
+                originalFileName,
                 cancellationToken);
 
             foreach (var rawRow in parsedRows)
@@ -106,6 +105,14 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
 
                     var insertedImportRowIds = new List<long>();
 
+                    if (state.IsChanged)
+                    {
+                        await _repository.SupersedeCurrentRowsByExternalRowKeyAsync(
+                            rawRow.ExternalRowKey,
+                            null,
+                            cancellationToken);
+                    }
+
                     for (var i = 0; i < pets.Count; i++)
                     {
                         var importRow = MapToImportRow(rawRow, pets[i], i + 1);
@@ -123,12 +130,10 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
                             cancellationToken);
                     }
 
-                    if (state.IsChanged &&
-                        state.ExistingImportRowId.HasValue &&
-                        insertedImportRowIds.Count > 0)
+                    if (state.IsChanged && insertedImportRowIds.Count > 0)
                     {
-                        await _repository.SupersedeImportRowAsync(
-                            state.ExistingImportRowId.Value,
+                        await _repository.SetReplacementForSupersededRowsAsync(
+                            rawRow.ExternalRowKey,
                             insertedImportRowIds[0],
                             cancellationToken);
                     }
@@ -143,7 +148,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
                         rowEx,
                         "Erro ao processar linha {RowNumber} do arquivo {FileName}",
                         rawRow.SourceRowNumber,
-                        fileName);
+                        originalFileName);
                 }
             }
 
@@ -169,11 +174,11 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
                 runSummary,
                 cancellationToken);
 
-            MoveToProcessedFolder(filePath);
+            CopyToProcessedFolder(originalFilePath);
 
             _logger.LogInformation(
                 "Processamento concluido. Arquivo={FileName}; Processadas={ProcessedRows}; Sucesso={SuccessRows}; Ignoradas={IgnoredRows}; Erros={ErrorRows}",
-                fileName,
+                originalFileName,
                 processedRows,
                 successRows,
                 ignoredRows,
@@ -183,7 +188,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
         {
             _logger.LogWarning(
                 "Processamento cancelado para o arquivo {FileName}",
-                fileName);
+                originalFileName);
 
             if (processingRunId != Guid.Empty)
             {
@@ -211,7 +216,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
             _logger.LogError(
                 ex,
                 "Falha operacional ao processar o arquivo {FileName}",
-                fileName);
+                originalFileName);
 
             if (processingRunId != Guid.Empty)
             {
@@ -232,7 +237,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
                     ex.Message);
             }
 
-            MoveToErrorFolder(filePath);
+            CopyToErrorFolder(originalFilePath);
 
             throw;
         }
@@ -287,7 +292,7 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
         };
     }
 
-    private void MoveToProcessedFolder(string filePath)
+    private void CopyToProcessedFolder(string filePath)
     {
         if (string.IsNullOrWhiteSpace(_options.ProcessedFolder))
         {
@@ -296,17 +301,11 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
 
         Directory.CreateDirectory(_options.ProcessedFolder);
 
-        var destinationPath = BuildDestinationPath(_options.ProcessedFolder, filePath);
-
-        if (File.Exists(destinationPath))
-        {
-            File.Delete(destinationPath);
-        }
-
-        File.Move(filePath, destinationPath);
+        var destinationPath = BuildTimestampedCopyPath(_options.ProcessedFolder, filePath);
+        File.Copy(filePath, destinationPath, overwrite: false);
     }
 
-    private void MoveToErrorFolder(string filePath)
+    private void CopyToErrorFolder(string filePath)
     {
         if (string.IsNullOrWhiteSpace(_options.ErrorFolder))
         {
@@ -320,20 +319,18 @@ public sealed class SpreadsheetImportService : ISpreadsheetImportService
 
         Directory.CreateDirectory(_options.ErrorFolder);
 
-        var destinationPath = BuildDestinationPath(_options.ErrorFolder, filePath);
-
-        if (File.Exists(destinationPath))
-        {
-            File.Delete(destinationPath);
-        }
-
-        File.Move(filePath, destinationPath);
+        var destinationPath = BuildTimestampedCopyPath(_options.ErrorFolder, filePath);
+        File.Copy(filePath, destinationPath, overwrite: false);
     }
 
-    private static string BuildDestinationPath(string folderPath, string originalFilePath)
+    private static string BuildTimestampedCopyPath(string folderPath, string originalFilePath)
     {
-        var fileName = Path.GetFileName(originalFilePath);
-        return Path.Combine(folderPath, fileName);
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(originalFilePath);
+        var extension = Path.GetExtension(originalFilePath);
+        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmm");
+
+        var newFileName = $"{fileNameWithoutExtension}_{timestamp}{extension}";
+        return Path.Combine(folderPath, newFileName);
     }
 
     private async Task SafeFinishRunAsync(

@@ -19,6 +19,7 @@ internal class Program
         builder.Services.AddSingleton<UnifiedPaymentsWorkbookParser>();
         builder.Services.AddSingleton<IEtlRepository, EtlRepository>();
         builder.Services.AddSingleton<ISpreadsheetImportService, SpreadsheetImportService>();
+        builder.Services.AddSingleton<IProcessedFileStateStore, ProcessedFileStateStore>();
 
         builder.Services.AddHostedService<WorkerService>();
         builder.Services.AddSingleton<SpreadsheetImportService>();

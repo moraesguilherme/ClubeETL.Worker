@@ -2,5 +2,5 @@
 
 public interface ISpreadsheetImportService
 {
-    Task ProcessFileAsync(string filePath, CancellationToken cancellationToken);
+    Task ProcessFileAsync(string filePath, string originalFilePath, CancellationToken cancellationToken);
 }

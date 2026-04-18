@@ -1,4 +1,6 @@
 using ClubeETL.Worker.Configuration;
+using ClubeETL.Worker.Models;
+using ClubeETL.Worker.Utils;
 using Microsoft.Extensions.Options;
 
 namespace ClubeETL.Worker.Services;
@@ -6,17 +8,20 @@ namespace ClubeETL.Worker.Services;
 public sealed class WorkerService : BackgroundService
 {
     private readonly ISpreadsheetImportService _spreadsheetImportService;
+    private readonly IProcessedFileStateStore _processedFileStateStore;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly EtlOptions _options;
     private readonly ILogger<WorkerService> _logger;
 
     public WorkerService(
         ISpreadsheetImportService spreadsheetImportService,
+        IProcessedFileStateStore processedFileStateStore,
         IHostApplicationLifetime lifetime,
         IOptions<EtlOptions> options,
         ILogger<WorkerService> logger)
     {
         _spreadsheetImportService = spreadsheetImportService;
+        _processedFileStateStore = processedFileStateStore;
         _lifetime = lifetime;
         _options = options.Value;
         _logger = logger;
@@ -32,13 +37,6 @@ public sealed class WorkerService : BackgroundService
 
             var pendingFiles = GetPendingFiles();
 
-            if (pendingFiles.Count == 0)
-            {
-                _logger.LogInformation("Nenhum arquivo pendente encontrado em {InputFolder}", _options.InputFolder);
-                _lifetime.StopApplication();
-                return;
-            }
-
             foreach (var filePath in pendingFiles)
             {
                 if (stoppingToken.IsCancellationRequested)
@@ -46,14 +44,7 @@ public sealed class WorkerService : BackgroundService
                     break;
                 }
 
-                try
-                {
-                    await _spreadsheetImportService.ProcessFileAsync(filePath, stoppingToken);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Erro ao processar arquivo {FilePath} no modo Manual.", filePath);
-                }
+                await TryProcessFileAsync(filePath, stoppingToken);
             }
 
             _lifetime.StopApplication();
@@ -71,28 +62,14 @@ public sealed class WorkerService : BackgroundService
             {
                 var pendingFiles = GetPendingFiles();
 
-                if (pendingFiles.Count == 0)
+                foreach (var filePath in pendingFiles)
                 {
-                    _logger.LogDebug("Nenhum arquivo pendente encontrado.");
-                }
-                else
-                {
-                    foreach (var filePath in pendingFiles)
+                    if (stoppingToken.IsCancellationRequested)
                     {
-                        if (stoppingToken.IsCancellationRequested)
-                        {
-                            break;
-                        }
-
-                        try
-                        {
-                            await _spreadsheetImportService.ProcessFileAsync(filePath, stoppingToken);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Erro ao processar arquivo {FilePath} no modo Watch.", filePath);
-                        }
+                        break;
                     }
+
+                    await TryProcessFileAsync(filePath, stoppingToken);
                 }
             }
             catch (Exception ex)
@@ -101,6 +78,57 @@ public sealed class WorkerService : BackgroundService
             }
 
             await Task.Delay(TimeSpan.FromSeconds(_options.PollingIntervalSeconds), stoppingToken);
+        }
+    }
+
+    private async Task TryProcessFileAsync(string filePath, CancellationToken stoppingToken)
+    {
+        if (FileSnapshotHelper.IsTemporaryOfficeFile(filePath))
+        {
+            _logger.LogDebug("Arquivo temporario do Office ignorado: {FilePath}", filePath);
+            return;
+        }
+
+        if (!File.Exists(filePath))
+        {
+            return;
+        }
+
+        var fingerprint = FileProcessingFingerprint.FromFile(filePath);
+
+        if (_processedFileStateStore.HasSameSuccessfulFingerprint(fingerprint))
+        {
+            _logger.LogDebug(
+                "Arquivo sem alteracao fisica desde a ultima execucao bem-sucedida. Ignorado: {FilePath}",
+                filePath);
+            return;
+        }
+
+        string? snapshotPath = null;
+
+        try
+        {
+            snapshotPath = FileSnapshotHelper.CreateSnapshotCopy(filePath);
+
+            await _spreadsheetImportService.ProcessFileAsync(snapshotPath, filePath, stoppingToken);
+
+            _processedFileStateStore.MarkAsSuccessfullyProcessed(fingerprint);
+            await _processedFileStateStore.SaveAsync(stoppingToken);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Arquivo indisponivel para snapshot/leitura neste ciclo: {FilePath}",
+                filePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao processar arquivo {FilePath}.", filePath);
+        }
+        finally
+        {
+            FileSnapshotHelper.TryDeleteSnapshot(snapshotPath);
         }
     }
 
@@ -123,11 +151,6 @@ public sealed class WorkerService : BackgroundService
             ".xlsx",
             ".xls"
         };
-
-        if (_options.IncludeCsv)
-        {
-            allowedExtensions.Add(".csv");
-        }
 
         return Directory
             .EnumerateFiles(_options.InputFolder, "*.*", SearchOption.TopDirectoryOnly)

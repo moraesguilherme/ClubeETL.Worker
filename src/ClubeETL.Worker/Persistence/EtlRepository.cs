@@ -178,6 +178,51 @@ public sealed class EtlRepository : IEtlRepository
         };
     }
 
+    public async Task SupersedeCurrentRowsByExternalRowKeyAsync(
+        string externalRowKey,
+        long? replacedByImportRowId,
+        CancellationToken cancellationToken)
+    {
+        const string sql = "dbo.usp_etl_import_row_supersede_current";
+
+        using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+
+        var parameters = new DynamicParameters();
+        parameters.Add("@ExternalRowKey", externalRowKey, DbType.String);
+        parameters.Add("@ReplacedByImportRowId", replacedByImportRowId, DbType.Int64);
+        parameters.Add("@SupersededAt", DateTime.UtcNow, DbType.DateTime2);
+
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                sql,
+                parameters,
+                commandType: CommandType.StoredProcedure,
+                cancellationToken: cancellationToken));
+    }
+
+    public async Task SetReplacementForSupersededRowsAsync(
+    string externalRowKey,
+    long replacedByImportRowId,
+    CancellationToken cancellationToken)
+    {
+        const string sql = "dbo.usp_etl_import_row_set_replacement_for_superseded";
+
+        using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+
+        var parameters = new DynamicParameters();
+        parameters.Add("@ExternalRowKey", externalRowKey, DbType.String);
+        parameters.Add("@ReplacedByImportRowId", replacedByImportRowId, DbType.Int64);
+
+        await connection.ExecuteAsync(
+            new CommandDefinition(
+                sql,
+                parameters,
+                commandType: CommandType.StoredProcedure,
+                cancellationToken: cancellationToken));
+    }
+
     public async Task<long> CreateImportRowAsync(
         Guid batchId,
         ImportRowModel row,
@@ -238,29 +283,6 @@ public sealed class EtlRepository : IEtlRepository
 
         return inserted.Id;
     }
-
-    public async Task SupersedeImportRowAsync(
-        long importRowId,
-        long replacedByImportRowId,
-        CancellationToken cancellationToken)
-    {
-        const string sql = "dbo.usp_etl_import_row_supersede";
-
-        using var connection = CreateConnection();
-        await connection.OpenAsync(cancellationToken);
-
-        var parameters = new DynamicParameters();
-        parameters.Add("@ExistingImportRowId", importRowId, DbType.Int64);
-        parameters.Add("@ReplacedByImportRowId", replacedByImportRowId, DbType.Int64);
-
-        await connection.ExecuteAsync(
-            new CommandDefinition(
-                sql,
-                parameters,
-                commandType: CommandType.StoredProcedure,
-                cancellationToken: cancellationToken));
-    }
-
     public async Task SetImportRowStatusAsync(
         long importRowId,
         string status,
